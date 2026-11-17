@@ -1,0 +1,80 @@
+export const REMEDIATION_ACTIONS = Object.freeze([
+  'RESTART',
+  'ROLLBACK',
+  'SCALE_UP',
+  'SCALE_DOWN',
+  'NONE',
+]);
+
+// The five alert names: the contract between the generated Prometheus rules
+// (templates/prometheus) and remediation (decision.service.js). Not a
+// database enum, since Incident.alertName also records unknown alerts.
+export const ALERT_NAMES = Object.freeze([
+  'KairoAppDown',
+  'KairoOOMKilled',
+  'KairoCrashLoop',
+  'KairoHighCpu',
+  'KairoHighLatency',
+]);
+
+// FR-72 (added 11 Nov): one of these firing inside a release's grace window
+// keeps it from being marked healthy, even if it resolves before the end
+export const HEALTH_BLOCKING_ALERTS = Object.freeze(['KairoOOMKilled', 'KairoCrashLoop']);
+
+export const INCIDENT_STATUSES = Object.freeze(['OPEN', 'RESOLVED']);
+
+// Incident.alertName of a manual rollback from the release list (FR-61, P4d).
+// Not an alert: the incident is Kairo's own record of a person's rollback,
+// so it keeps its attempt and its 90 s check like any other
+export const MANUAL_ROLLBACK = 'ManualRollback';
+
+export const ATTEMPT_TRIGGERS = Object.freeze(['AUTO', 'MANUAL']);
+
+// APPLIED    the action ran, not checked yet
+// VERIFIED   the check afterwards passed (FR-73, P3)
+// UNVERIFIED the check timed out, app goes to NEEDS_ATTENTION
+// FAILED     the action itself errored
+// SKIPPED    nothing was done: dry run, no action for this alert, auto-heal
+//            off, given up, a rollout or another action in progress, or the
+//            alert resolved during a grace window before its deferred action
+// SKIPPED, UNVERIFIED and FAILED attempts carry a `reason` saying why (P3)
+export const ATTEMPT_RESULTS = Object.freeze([
+  'APPLIED',
+  'VERIFIED',
+  'UNVERIFIED',
+  'FAILED',
+  'SKIPPED',
+]);
+
+/**
+ * One action Kairo took for an incident.
+ * @typedef {object} RemediationAttempt
+ * @property {string} id
+ * @property {string} action                one of REMEDIATION_ACTIONS
+ * @property {string} trigger               one of ATTEMPT_TRIGGERS
+ * @property {boolean} dryRun
+ * @property {string} result                one of ATTEMPT_RESULTS
+ * @property {string | null} fromReleaseId
+ * @property {string | null} toReleaseId
+ * @property {string} attemptedAt           ISO date
+ * @property {string | null} verifiedAt     ISO date
+ * @property {string | null} reason         why it was SKIPPED, UNVERIFIED or FAILED (P3)
+ */
+
+/**
+ * What GET /api/incidents returns (a list of these).
+ * @typedef {object} Incident
+ * @property {string} id
+ * @property {string} appId
+ * @property {string} appName                the App's slug
+ * @property {string} alertName
+ * @property {string} cause
+ * @property {string} status                 one of INCIDENT_STATUSES
+ * @property {string | null} explanation     Gemini, P4
+ * @property {string} startedAt              ISO date
+ * @property {string | null} resolvedAt      ISO date
+ * @property {number | null} recoverySeconds null while still open
+ * @property {number | null} githubIssueNumber
+ * @property {string | null} githubIssueUrl   FR-55, P4d
+ * @property {RemediationAttempt[]} attempts oldest first
+ */
