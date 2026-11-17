@@ -1,0 +1,27 @@
+node_modules/
+dist/
+coverage/
+*.log
+
+.env
+.env.local
+
+.DS_Store
+.vscode/
+.idea/
+
+# terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+# holds the alert webhook token
+*.tfvars
+# GitHub App private key (PQ8); it lives in ~/.kairo, this is a safety net
+*.pem
+
+# planning docs
+docs/planning/
+CLAUDE.md
+CLAUDE.local.md
+.claude/
