@@ -1,0 +1,127 @@
+import { createApp } from './app.js';
+import { env, githubConfigured } from './config/env.config.js';
+import { emptyWorkspace, failInterruptedRuns } from './generator/pipeline.service.js';
+import { checkPrStates, onPreviewHealthy, onPreviewUnhealthy, resumePendingPrs } from './generator/pr/pr.service.js';
+import { every } from './jobs/scheduler.js';
+import {
+  FLUSH_INTERVAL_MS,
+  flushUnsaved,
+  hasOpenIncident,
+  rebuildIncidentState,
+  runDeferredActions,
+} from './remediation/incident/incident.service.js';
+import { rebuild as rebuildHealingState } from './remediation/healing/healing.state.js';
+import { clearOnHealthyRelease, clearQuietApps } from './remediation/healing/health.service.js';
+import { resumeVerifications } from './remediation/healing/verify.service.js';
+import { closeLeftoverManual } from './remediation/healing/rollback.service.js';
+import { checkScaleDown, SCALE_DOWN_INTERVAL_MS } from './remediation/scaling/scaledown.service.js';
+import { checkGhcr, WATCH_INTERVAL_MS } from './shipping/ghcr.watcher.js';
+import { configureGrace, rebuildGrace } from './shipping/grace.service.js';
+import { startTunnelsAtBoot, stopAllTunnels } from './tunnel/tunnel.service.js';
+import { startPrometheusForward, stopPrometheusForward } from './prometheus/forward.service.js';
+import { checkGemini } from './gemini/gemini.client.js';
+import { prisma } from './db/index.js';
+import { createLogger } from './utils/logger.js';
+
+const log = createLogger('server');
+
+// FR-34: PR state every 60 s
+const PR_CHECK_MS = 60_000;
+// FR-49: NEEDS_ATTENTION clears after 10 quiet minutes, checked every 60 s
+const ATTENTION_CHECK_MS = 60_000;
+
+async function main() {
+  // the grace window (shipping/) learns about alerts from remediation/, hands
+  // healthy previews to the PR code in generator/, and tells remediation/ to
+  // run the actions it deferred, without shipping/ importing either package
+  configureGrace({
+    isAlerting: hasOpenIncident,
+    onHealthy: async (release, app, { newlyMarked }) => {
+      // FR-49: a release newly marked healthy ends NEEDS_ATTENTION (decision 7)
+      if (newlyMarked) clearOnHealthyRelease(app.slug, release);
+      await onPreviewHealthy(release, app);
+    },
+    onUnhealthy: onPreviewUnhealthy,
+    onEnd: runDeferredActions,
+  });
+
+  try {
+    const stuck = await failInterruptedRuns();
+    if (stuck > 0) log.warn(`marked ${stuck} half-finished pipeline run(s) as FAILED`);
+    // a manual rollback has no alert to resolve it: close any the restart left open
+    const leftover = await closeLeftoverManual();
+    if (leftover > 0) log.info(`closed ${leftover} manual rollback incident(s) left open`);
+    // FR-74: healing decides from memory, filled from the database once here
+    const state = await rebuildIncidentState();
+    const healing = await rebuildHealingState();
+    log.info(
+      `healing state: ${state.openIncidents} open incident(s), ${state.apps} app(s), ${healing.recentAttempts} attempt(s) in the last 10 min`,
+    );
+    // FR-73: checks the backend stopped in the middle of
+    const resumed = await resumeVerifications();
+    if (resumed > 0) log.info(`resumed ${resumed} action check(s)`);
+    // after the incidents: the healthy check reads them
+    const windows = await rebuildGrace();
+    if (windows > 0) log.info(`resumed ${windows} grace window(s)`);
+  } catch (err) {
+    // most likely postgres isn't running. still start so /api/health can say so
+    log.error('could not reach the database on startup', err);
+  }
+
+  // FR-57: the way to Prometheus, kept open by the backend itself
+  startPrometheusForward().catch((err) => log.error('could not start the Prometheus port-forward', err));
+
+  // FR-40: public links for the apps already running
+  startTunnelsAtBoot()
+    .then((n) => n > 0 && log.info(`starting ${n} public link(s)`))
+    .catch((err) => log.error('could not start the public links', err));
+
+  // FR-20: is the key good and the model there? Only sets the header pill
+  checkGemini();
+
+  const leftovers = await emptyWorkspace();
+  if (leftovers > 0) log.warn(`removed ${leftovers} leftover clone folder(s) from the workspace`);
+
+  const server = createApp().listen(env.port, () => {
+    log.info(`kairo api listening on http://localhost:${env.port}`);
+    if (env.remediationDryRun) log.info('remediation is in DRY RUN mode');
+    if (!env.alertWebhookToken) log.warn('ALERT_WEBHOOK_TOKEN is not set: every /api/alerts call will get 401');
+    if (!githubConfigured()) log.warn('the GitHub App is not configured (GITHUB_APP_*, GITHUB_CLIENT_*): sign-in is off');
+    if (!env.sessionSecret) log.warn('SESSION_SECRET is not set: nobody can sign in');
+    if (env.allowedLogins.size === 0) log.warn('ALLOWED_GITHUB_LOGINS is empty: everyone will see "Not invited"');
+  });
+
+  if (githubConfigured()) {
+    resumePendingPrs().catch((err) => log.error('could not resume pending PRs', err));
+    every('PR state check', PR_CHECK_MS, checkPrStates);
+    // FR-35: merged apps get every new commit's GHCR image
+    every('GHCR watcher', WATCH_INTERVAL_MS, checkGhcr);
+  }
+
+  // FR-47 and FR-49
+  every('scale-down check', SCALE_DOWN_INTERVAL_MS, checkScaleDown);
+  every('needs-attention check', ATTENTION_CHECK_MS, () => clearQuietApps({ isAlerting: hasOpenIncident }));
+
+  // incident writes that failed during a database outage are saved once it's back (FR-74)
+  const flushTimer = setInterval(() => {
+    flushUnsaved().catch((err) => log.error('flushing unsaved incidents failed', err));
+  }, FLUSH_INTERVAL_MS);
+  flushTimer.unref();
+
+  const shutdown = (signal) => {
+    log.info(`${signal} received, shutting down`);
+    stopAllTunnels();
+    stopPrometheusForward();
+    server.close(async () => {
+      await prisma.$disconnect();
+      process.exit(0);
+    });
+    // don't hang forever on a stuck keep-alive connection
+    setTimeout(() => process.exit(1), 5000).unref();
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+}
+
+main();
